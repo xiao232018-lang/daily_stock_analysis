@@ -51,6 +51,7 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
+          pip install akshare pandas
       
       - name: 创建必要目录
         run: |
@@ -233,6 +234,27 @@ jobs:
             FORCE_RUN_ARG="--force-run"
             echo "⚡ 已启用强制运行模式（跳过交易日检查）"
           fi
+          # ==========================================
+          # 🤖 运行量化初筛脚本 (合并自选股与量化池)
+          # ==========================================
+          if [ "$MODE" != "market-only" ]; then
+            echo "🔎 正在执行盘后量化初筛策略..."
+            # 运行脚本获取那 5 只潜力股
+            PICKED_STOCKS=$(python auto_picker.py | tail -n 1)
+            
+            if [ ! -z "$PICKED_STOCKS" ]; then
+              echo "🎯 量化选股成功，今日潜力股: $PICKED_STOCKS"
+              echo "📌 你原本的自选股: $STOCK_LIST"
+              
+              # 【核心修改点】将原来的股票和新选出的股票用逗号拼接在一起！
+              export STOCK_LIST="${STOCK_LIST},${PICKED_STOCKS}"
+              
+              echo "📈 最终合并分析清单: $STOCK_LIST"
+            else
+              echo "⚠️ 量化未匹配到合适标的，将仅分析默认自选股: $STOCK_LIST"
+            fi
+          fi
+          echo "=========================================="
 
           # 执行分析
           if [ "$MODE" = "market-only" ]; then
