@@ -13,8 +13,8 @@ pro = ts.pro_api(token)
 
 def get_potential_stocks():
     """
-    量化策略：【主升浪·量价突破与龙回头评分模型】
-    作者：基于顶尖游资与量化逻辑构建
+    量化策略：【主升浪·量价突破与龙回头评分模型】(Tushare 官方规范版)
+    针对用户权限专门优化，仅使用 top_list 解析龙虎榜情绪。
     """
     try:
         # ==========================================
@@ -33,7 +33,7 @@ def get_potential_stocks():
         logging.info(f"🚀 趋势接力量化引擎启动，基准日: {T0}")
 
         # ==========================================
-        # 1. 底层行情与 MA5 计算
+        # 1. 底层行情与 MA5 计算 (严格提取所需字段)
         # ==========================================
         df_daily_15d = pro.daily(start_date=dates_15[0], end_date=T0)
         df_daily_15d = df_daily_15d.sort_values(['ts_code', 'trade_date'])
@@ -56,31 +56,48 @@ def get_potential_stocks():
         limit_up_codes = df_past_10[df_past_10['pct_chg'] >= 9.5]['ts_code'].unique().tolist()
 
         # ==========================================
-        # 3. 主力资金与龙虎榜捕获 (近3日)
+        # 3. 主力资金 (Moneyflow) 获取
         # ==========================================
-        # 资金建仓
-        df_mf_list = [pro.moneyflow(trade_date=d)[['ts_code', 'net_mf_amount']] for d in dates_3]
-        mf_agg = pd.concat(df_mf_list).groupby('ts_code')['net_mf_amount'].sum().reset_index()
-        mf_agg.rename(columns={'net_mf_amount': 'mf_3d_sum'}, inplace=True)
-        df = pd.merge(df, mf_agg, on='ts_code', how='inner')
+        df_mf_list = []
+        for d in dates_3:
+            try:
+                # 严格限定只取需要的字段，防冲突
+                mf = pro.moneyflow(trade_date=d)[['ts_code', 'net_mf_amount']]
+                df_mf_list.append(mf)
+            except Exception as e:
+                logging.debug(f"{d} moneyflow 获取异常: {e}")
+                pass
+                
+        if df_mf_list:
+            mf_agg = pd.concat(df_mf_list).groupby('ts_code')['net_mf_amount'].sum().reset_index()
+            mf_agg.rename(columns={'net_mf_amount': 'mf_3d_sum'}, inplace=True)
+            df = pd.merge(df, mf_agg, on='ts_code', how='inner')
+        else:
+            df['mf_3d_sum'] = 0.0 # 容错机制
 
-        # 龙虎榜
+        # ==========================================
+        # 4. 龙虎榜 (仅依赖 top_list 接口) 获取
+        # ==========================================
         top_list_frames = []
         for d in dates_3:
             try:
                 top_df = pro.top_list(trade_date=d)
-                if not top_df.empty: top_list_frames.append(top_df)
-            except: pass
+                if not top_df.empty and 'ts_code' in top_df.columns:
+                    top_list_frames.append(top_df)
+            except Exception as e:
+                logging.debug(f"{d} top_list 获取异常: {e}")
+                pass
             
-        top_codes, inst_buy_codes = [], []
+        top_codes, top_net_buy_codes = [], []
         if top_list_frames:
             top_all = pd.concat(top_list_frames)
             top_codes = top_all['ts_code'].unique().tolist()
-            # 机构真金白银净买入榜
-            inst_buy_codes = top_all[top_all['inst_buy'] > 0]['ts_code'].unique().tolist()
+            # 探测：如果 top_list 返回了 'net_amount' 字段 (龙虎榜席位净买额)，则进行净买入加分过滤
+            if 'net_amount' in top_all.columns:
+                top_net_buy_codes = top_all[top_all['net_amount'] > 0]['ts_code'].unique().tolist()
 
         # ==========================================
-        # 4. 基础面融合
+        # 5. 基础面融合 (日线基础与股票列表)
         # ==========================================
         df_basic = pro.daily_basic(trade_date=T0, fields='ts_code,turnover_rate,total_mv')
         df_info = pro.stock_basic(exchange='', list_status='L', fields='ts_code,name,market')
@@ -89,7 +106,7 @@ def get_potential_stocks():
         df = pd.merge(df, df_info, on='ts_code', how='inner')
 
         # ==========================================
-        # 5. 【执行硬性过滤门槛】(你的 5 大法则)
+        # 6. 【执行硬性过滤门槛】(核心漏斗)
         # ==========================================
         # 法则 4：主板非ST，股价<200，换手率3%~35%
         cond_board = df['ts_code'].str.match(r'^(60|00)')
@@ -98,19 +115,19 @@ def get_potential_stocks():
         cond_turnover = (df['turnover_rate'] >= 3.0) & (df['turnover_rate'] <= 35.0)
         
         # 法则 3：量价点火铁证 (涨幅2%~11% + 成交量>昨1.5倍 + 成交额>5亿)
+        # Tushare 的 amount 单位是千元。500,000 = 5亿
         cond_ignition = (df['pct_chg'] >= 2.0) & (df['pct_chg'] <= 11.0)
         cond_volume = df['vol'] > (df['vol_t1'] * 1.5)
-        cond_amt = df['amount'] >= 500000 # Tushare 单位千元，500,000=5亿
+        cond_amt = df['amount'] >= 500000 
         
-        # 法则 2：主力建仓 (近3日资金呈净流入状态)
+        # 法则 2：主力建仓 (近3日主力资金呈净流入状态)
         cond_money = df['mf_3d_sum'] > 0
 
         # 法则 1：【趋势双轨承接算法】
-        # 轨道 A (踩5日线强承接): 5日线向上 + 盘中回踩极度逼近/击穿5日线(下探至1.02以内) + 收盘稳站5日线
+        # 轨道 A (踩5日线强承接): 5日线向上 + 盘中最低价下探逼近/击穿5日线(1.02内) + 收盘稳站5日线
         cond_trend_A = (df['ma5'] > df['ma5_t1']) & (df['low'] <= df['ma5'] * 1.02) & (df['close'] > df['ma5'])
-        # 轨道 B (涨停洗盘后收复): 近期有过涨停 + 经历调整后今日强势站回5日线之上
+        # 轨道 B (涨停洗盘后收复): 近期有过涨停 + 今日强势收复 5日线
         cond_trend_B = df['ts_code'].isin(limit_up_codes) & (df['close'] > df['ma5'])
-        # 满足其一即可
         cond_trend = cond_trend_A | cond_trend_B
 
         # 组合所有过滤网
@@ -125,26 +142,29 @@ def get_potential_stocks():
             return []
 
         # ==========================================
-        # 6. 【多因子综合评分模型】(选出真正王者)
+        # 7. 【多因子综合评分模型】(打分决选)
         # ==========================================
         screened_df['score'] = 0.0
 
         # 维度 1: 资金建仓力度 (3日主力净流入，每 1000 万得 1 分)
         screened_df['score'] += (screened_df['mf_3d_sum'] / 1000)
         
-        # 维度 2: 机构点火爆量 (放量倍数直接放大 15 倍，比如今天爆量 2 倍，得 30 分)
+        # 维度 2: 资金点火爆量 (放量倍数放大 15 倍，例如 2 倍爆量得 30 分)
         screened_df['score'] += (screened_df['vol'] / screened_df['vol_t1']) * 15
         
         # 维度 3: 市场绝对核心 (成交额每多 1 亿元得 2 分，大票流动性溢价)
         screened_df['score'] += (screened_df['amount'] / 100000) * 2
         
         # 维度 4: 龙虎榜光环与涨停记忆 (情绪溢价)
-        screened_df.loc[screened_df['ts_code'].isin(top_codes), 'score'] += 20 # 上榜加20分
-        screened_df.loc[screened_df['ts_code'].isin(inst_buy_codes), 'score'] += 25 # 机构买入再加25分
-        screened_df.loc[screened_df['ts_code'].isin(limit_up_codes), 'score'] += 15 # 带有涨停基因加15分
+        # 只要上了龙虎榜(游资合力聚焦)，加 20 分
+        screened_df.loc[screened_df['ts_code'].isin(top_codes), 'score'] += 20 
+        # 如果龙虎榜整体显示资金是净买入的，再叠加 15 分
+        screened_df.loc[screened_df['ts_code'].isin(top_net_buy_codes), 'score'] += 15 
+        # 带有近期涨停基因，加 15 分
+        screened_df.loc[screened_df['ts_code'].isin(limit_up_codes), 'score'] += 15 
 
         # ==========================================
-        # 7. 终极决选与输出
+        # 8. 终极决选与输出
         # ==========================================
         top_stocks = screened_df.sort_values(by='score', ascending=False).head(5)
 
@@ -167,4 +187,5 @@ if __name__ == "__main__":
     else:
         stocks = get_potential_stocks()
         if stocks:
+            # 仅打印纯净代码列表，供 bash 中的 tail -n 1 捕获
             print(",".join(stocks))
