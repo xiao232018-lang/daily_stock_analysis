@@ -4,17 +4,17 @@ import os
 import logging
 from datetime import datetime, timedelta
 
-# 配置日志
+# 配置日志输出格式
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# 初始化 Tushare Pro
 token = os.getenv('TUSHARE_TOKEN')
 pro = ts.pro_api(token)
 
 def get_potential_stocks():
     """
-    量化策略：【主升浪·双轨猎手模型】(高容错版)
-    轨道一（3只）：稳健趋势核心（踩5日线、量价突破、主力流入）
-    轨道二（2只）：情绪龙头反包（近期涨停、龙虎榜、洗盘后收复5日线）
+    量化策略：【极简·5日线稳健趋势与放量点火模型】
+    目标：获取 4 只完美踩稳5日线、量价齐升且主力建仓的纯正趋势股。
     """
     try:
         # ==========================================
@@ -28,15 +28,15 @@ def get_potential_stocks():
         T0 = trade_dates[-1]  # 今日
         T1 = trade_dates[-2]  # 昨日
         T2 = trade_dates[-3]  # 前日
+        T3 = trade_dates[-4]  # 大前天
         
-        dates_15 = trade_dates[-15:]
-        dates_5 = trade_dates[-5:] # 近一周 (龙虎榜)
-        dates_3 = trade_dates[-3:] # 近3日 (资金)
+        dates_15 = trade_dates[-15:] # 取近15日计算MA5
+        dates_3 = trade_dates[-3:]   # 近3日看主力资金
         
-        logging.info(f"🚀 双轨猎手引擎启动，基准日: {T0}")
+        logging.info(f"🚀 极简趋势雷达启动，基准日: {T0}")
 
         # ==========================================
-        # 1. 底层行情与 MA5 计算
+        # 1. 底层行情、MA5 计算与时间平移
         # ==========================================
         df_daily = pro.daily(start_date=dates_15[0], end_date=T0)
         df_daily = df_daily.sort_values(['ts_code', 'trade_date'])
@@ -44,23 +44,22 @@ def get_potential_stocks():
         # 计算 5 日均线
         df_daily['ma5'] = df_daily.groupby('ts_code')['close'].transform(lambda x: x.rolling(5).mean())
         
-        df_t0 = df_daily[df_daily['trade_date'] == T0].copy()
-        df_t1 = df_daily[df_daily['trade_date'] == T1][['ts_code', 'close', 'vol', 'ma5']].rename(columns={'close': 'close_t1', 'vol': 'vol_t1', 'ma5': 'ma5_t1'})
-        df_t2 = df_daily[df_daily['trade_date'] == T2][['ts_code', 'close', 'ma5']].rename(columns={'close': 'close_t2', 'ma5': 'ma5_t2'})
+        # 将 T1, T2, T3 的关键数据平移到 T0 行，方便直接做对比
+        df_daily['close_t1'] = df_daily.groupby('ts_code')['close'].shift(1)
+        df_daily['ma5_t1'] = df_daily.groupby('ts_code')['ma5'].shift(1)
+        df_daily['vol_t1'] = df_daily.groupby('ts_code')['vol'].shift(1)
         
-        df = df_t0.merge(df_t1, on='ts_code', how='inner').merge(df_t2, on='ts_code', how='inner')
+        df_daily['close_t2'] = df_daily.groupby('ts_code')['close'].shift(2)
+        df_daily['ma5_t2'] = df_daily.groupby('ts_code')['ma5'].shift(2)
+        
+        df_daily['ma5_t3'] = df_daily.groupby('ts_code')['ma5'].shift(3)
+        
+        # 只保留 T0 (今日) 的切片数据
+        df_t0 = df_daily[df_daily['trade_date'] == T0].copy()
 
         # ==========================================
-        # 2. 涨停基因 (近10日)
+        # 2. 主力资金持续流入建仓 (近3日)
         # ==========================================
-        past_10_dates = dates_15[-11:-1]
-        df_past_10 = df_daily[df_daily['trade_date'].isin(past_10_dates)]
-        limit_up_codes = df_past_10[df_past_10['pct_chg'] >= 9.5]['ts_code'].unique().tolist()
-
-        # ==========================================
-        # 3. 主力资金 (近3日) 与 龙虎榜 (近5日)
-        # ==========================================
-        # 资金防爆破处理
         df_mf_list = []
         for d in dates_3:
             try:
@@ -68,105 +67,79 @@ def get_potential_stocks():
                 if not mf.empty: df_mf_list.append(mf)
             except: pass
             
-        has_mf_data = False
+        has_mf = False
         if df_mf_list:
             mf_agg = pd.concat(df_mf_list).groupby('ts_code')['net_mf_amount'].sum().reset_index()
             mf_agg.rename(columns={'net_mf_amount': 'mf_3d_sum'}, inplace=True)
-            df = pd.merge(df, mf_agg, on='ts_code', how='inner')
-            has_mf_data = True
+            df_t0 = pd.merge(df_t0, mf_agg, on='ts_code', how='inner')
+            has_mf = True
         else:
-            df['mf_3d_sum'] = 0.0
-
-        # 龙虎榜
-        top_codes_5d = []
-        for d in dates_5:
-            try:
-                top_df = pro.top_list(trade_date=d)
-                if not top_df.empty and 'ts_code' in top_df.columns:
-                    top_codes_5d.extend(top_df['ts_code'].tolist())
-            except: pass
-        top_codes_5d = list(set(top_codes_5d))
+            df_t0['mf_3d_sum'] = 0.0
 
         # ==========================================
-        # 4. 基础面融合
+        # 3. 基础面融合
         # ==========================================
         df_basic = pro.daily_basic(trade_date=T0, fields='ts_code,turnover_rate,total_mv')
         df_info = pro.stock_basic(exchange='', list_status='L', fields='ts_code,name,market')
-        df = pd.merge(df, df_basic, on='ts_code', how='inner')
+        
+        df = pd.merge(df_t0, df_basic, on='ts_code', how='inner')
         df = pd.merge(df, df_info, on='ts_code', how='inner')
 
         # ==========================================
-        # 5. 全局基础硬门槛 (活跃度与流动性)
+        # 4. 执行严谨的量化过滤逻辑
         # ==========================================
-        cond_base = (
-            df['ts_code'].str.match(r'^(60|00)') & 
-            (~df['name'].str.contains('ST|退')) & 
-            (df['close'] < 200) & 
-            (df['turnover_rate'] >= 3.0) & 
-            (df['amount'] >= 500000) # 5亿成交额
+        
+        # A. 基础要求：主板非ST，股价<200，换手活跃
+        cond_board = df['ts_code'].str.match(r'^(60|00)')
+        cond_not_st = ~df['name'].str.contains('ST|退')
+        cond_price = df['close'] < 200
+        cond_turnover = df['turnover_rate'] >= 3.0
+        
+        # B. 量价齐升与流动性：
+        # 今日涨幅 1% ~ 11%
+        # 成交量 > 昨 1.2倍
+        # 成交额 > 5亿 (Tushare单位千元，500,000=5亿)
+        cond_ignition = (df['pct_chg'] >= 1.0) & (df['pct_chg'] <= 11.0)
+        cond_volume = df['vol'] > (df['vol_t1'] * 1.2)
+        cond_amt = df['amount'] >= 500000 
+        
+        # C. 资金建仓：
+        # 如果获取到了资金数据，要求近3天主力累计净流入 > 0
+        cond_money = (df['mf_3d_sum'] > 0) if has_mf else True
+        
+        # D. 核心趋势：神仙 5 日线算法
+        # 1. 稳步上涨: 今天的5日线必须高于大前天的5日线 (ma5 > ma5_t3)
+        # 2. 今日站稳: 今天的收盘价必须 > 今天的5日线
+        # 3. 隔日收复(拒绝连续破位): 昨天或前天，必须有至少一天是站稳在当时5日线之上的
+        cond_trend = (
+            (df['ma5'] > df['ma5_t3']) & 
+            (df['close'] > df['ma5']) & 
+            ((df['close_t1'] > df['ma5_t1']) | (df['close_t2'] > df['ma5_t2']))
         )
-        df_base = df[cond_base].copy()
+
+        # 汇总所有条件
+        screened_df = df[
+            cond_board & cond_not_st & cond_price & cond_turnover & 
+            cond_ignition & cond_volume & cond_amt & 
+            cond_money & cond_trend
+        ].copy()
+
+        if screened_df.empty:
+            logging.warning("今日市场环境较弱，未捕捉到完美贴合【5日线强承接+爆量】的标的。")
+            return []
 
         # ==========================================
-        # 策略一：【稳健趋势股】(抽取 3 只)
+        # 5. 排序与精选 (取前 4 只)
         # ==========================================
-        # 1. 量价齐升：今日涨幅 1%~11%，量 > 昨 1.2倍
-        cond_A_ignition = (df_base['pct_chg'] >= 1.0) & (df_base['pct_chg'] <= 11.0)
-        cond_A_volume = df_base['vol'] > (df_base['vol_t1'] * 1.2)
-        
-        # 2. 主力建仓：如果有资金数据，则要求 > 0；如果 Tushare 没数据，跳过该限制防全军覆没
-        cond_A_money = (df_base['mf_3d_sum'] > 0) if has_mf_data else True
-        
-        # 3. 沿5日线稳步上涨算法 (极简暴力逻辑)：
-        # A. 今日必须收在 5 日线上 (close > ma5)
-        # B. 5 日线必须是向上的 (ma5 >= ma5_t1)
-        # C. 决不连续两天破位：昨天或前天，至少有一天是收在 5 日线上的！
-        cond_A_trend = (
-            (df_base['close'] > df_base['ma5']) & 
-            (df_base['ma5'] >= df_base['ma5_t1']) & 
-            ((df_base['close_t1'] > df_base['ma5_t1']) | (df_base['close_t2'] > df_base['ma5_t2']))
-        )
+        # 按【今日成交额】(代表市场绝对聚焦人气) 和 【主力流入量】 降序排列
+        top_stocks = screened_df.sort_values(by=['amount', 'mf_3d_sum'], ascending=[False, False]).head(4)
 
-        df_type_A = df_base[cond_A_ignition & cond_A_volume & cond_A_money & cond_A_trend].copy()
+        stock_list = [code.split('.')[0] for code in top_stocks['ts_code'].tolist()]
+        names = top_stocks['name'].tolist()
         
-        # 排序：优先主力资金，其次看总成交额，取前 3
-        top_A = df_type_A.sort_values(by=['mf_3d_sum', 'amount'], ascending=[False, False]).head(3)
-        codes_A = top_A['ts_code'].tolist()
-        names_A = top_A['name'].tolist()
-
-        # ==========================================
-        # 策略二：【涨停反包龙头】(抽取 2 只)
-        # ==========================================
-        # 1. 近期有过涨停
-        cond_B_limit = df_base['ts_code'].isin(limit_up_codes)
+        logging.info(f"🎯 趋势量化模型斩获龙头！精选 4 只标的: {list(zip(stock_list, names))}")
         
-        # 2. 近一周上过龙虎榜 (增加防爆破：如果龙虎榜接口全没数据，则取消硬性要求)
-        cond_B_top_list = df_base['ts_code'].isin(top_codes_5d) if top_codes_5d else True
-        
-        # 3. 调整后今日重新站稳 5日线：昨天或今天盘中破了5日线，但今天收盘站回来了！
-        cond_B_trend = (df_base['close'] > df_base['ma5']) & ((df_base['close_t1'] <= df_base['ma5_t1']) | (df_base['low'] <= df_base['ma5'] * 1.02))
-        
-        # 4. 去重：已被策略A选中的不再选
-        cond_B_distinct = ~df_base['ts_code'].isin(codes_A)
-
-        df_type_B = df_base[cond_B_limit & cond_B_top_list & cond_B_trend & cond_B_distinct].copy()
-        
-        # 排序：妖股反包看绝对人气，按成交额降序取前 2
-        top_B = df_type_B.sort_values(by='amount', ascending=False).head(2)
-        codes_B = top_B['ts_code'].tolist()
-        names_B = top_B['name'].tolist()
-
-        # ==========================================
-        # 终极合并输出
-        # ==========================================
-        final_codes = [c.split('.')[0] for c in (codes_A + codes_B)]
-        final_names = names_A + names_B
-        
-        logging.info(f"📊 策略A(趋势核心)捕获: {list(zip([c.split('.')[0] for c in codes_A], names_A))}")
-        logging.info(f"📊 策略B(妖股反包)捕获: {list(zip([c.split('.')[0] for c in codes_B], names_B))}")
-        logging.info(f"🏆 最终合并自选标的池: {list(zip(final_codes, final_names))}")
-        
-        return final_codes
+        return stock_list
 
     except Exception as e:
         logging.error(f"量化策略运行出现异常: {e}")
