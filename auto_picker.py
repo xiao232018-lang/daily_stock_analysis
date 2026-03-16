@@ -13,129 +13,97 @@ pro = ts.pro_api(token)
 
 def get_potential_stocks():
     """
-    量化策略：【主升浪·主力箱体吸筹与点火模型】(终极稳定版)
-    核心逻辑：
-    1. 资金面：近 5 天内至少 3 天主力净流入且总额 > 5000万。
-    2. 形态面：近 15 天内股价振幅 < 25%，证明主力在控盘压价吸筹。
-    3. 启动面：今日温和洗盘或点火突破（涨跌幅 -3% ~ 9%）。
-    4. 基础面：主板、非ST、股价<200、换手率 3%~20%。
+    量化策略：【业内标准：多头趋势 + 放量突破 + 资金共振模型】
     """
     try:
-        # 1. 划定时间窗口：取近 15 个交易日和近 5 个交易日
+        # 1. 获取最近 65 个交易日的日历，精准定位 T0, T-1, T-20, T-60
         cal = pro.trade_cal(exchange='', is_open='1', 
-                            start_date=(datetime.now() - timedelta(days=30)).strftime('%Y%m%d'), 
+                            start_date=(datetime.now() - timedelta(days=100)).strftime('%Y%m%d'), 
                             end_date=datetime.now().strftime('%Y%m%d'))
-        dates_15 = cal['cal_date'].tolist()[-15:]
-        dates_5 = dates_15[-5:]
-        last_date = dates_15[-1]
+        trade_dates = cal['cal_date'].tolist()
         
-        logging.info(f"正在扫描全市场，分析时间窗口: {dates_15[0]} 至 {last_date}")
+        T0 = trade_dates[-1]   # 今天(或最近一个交易日)
+        T1 = trade_dates[-2]   # 昨天
+        T20 = trade_dates[-21] # 20个交易日（约1个月前）
+        T60 = trade_dates[-61] # 60个交易日（约3个月前）
+        
+        logging.info(f"量化引擎启动，基准日: {T0}。比对周期: {T1}, {T20}, {T60}")
 
-        # ==========================================
-        # 模块一：【资金连续潜伏探测】
-        # ==========================================
-        df_mf_list = [pro.moneyflow(trade_date=d) for d in dates_5]
-        df_mf_5d = pd.concat(df_mf_list)
+        # 2. 提取不同时间节点的行情数据
+        # 获取 T0 (今日) 数据
+        df_t0 = pro.daily(trade_date=T0)[['ts_code', 'close', 'open', 'pct_chg', 'vol']]
+        df_t0.rename(columns={'close': 'close_T0', 'vol': 'vol_T0'}, inplace=True)
         
-        # 标记每天是否有主力净流入 (>0)
-        df_mf_5d['is_inflow'] = df_mf_5d['net_mf_amount'].apply(lambda x: 1 if x > 0 else 0)
+        # 获取 T1 (昨日) 数据，用于计算是否放量
+        df_t1 = pro.daily(trade_date=T1)[['ts_code', 'vol']]
+        df_t1.rename(columns={'vol': 'vol_T1'}, inplace=True)
         
-        # 聚合计算近 5 天的总流入额，以及“正向流入的天数”
-        mf_agg = df_mf_5d.groupby('ts_code').agg(
-            mf_5d_sum=('net_mf_amount', 'sum'),
-            inflow_days=('is_inflow', 'sum')
-        ).reset_index()
+        # 获取 T20 和 T60 数据，用于判断长期趋势
+        df_t20 = pro.daily(trade_date=T20)[['ts_code', 'close']]
+        df_t20.rename(columns={'close': 'close_T20'}, inplace=True)
         
-        # 核心条件：5天内至少3天净买入，且累计净流入 > 5000 万
-        cond_money = (mf_agg['inflow_days'] >= 3) & (mf_agg['mf_5d_sum'] > 5000)
-        valid_mf_stocks = mf_agg[cond_money]
+        df_t60 = pro.daily(trade_date=T60)[['ts_code', 'close']]
+        df_t60.rename(columns={'close': 'close_T60'}, inplace=True)
 
-        if valid_mf_stocks.empty:
-            logging.warning("未检测到明显的连续吸筹资金，提前结束筛选。")
-            return []
-
-        # ==========================================
-        # 模块二：【箱体压盘探测】
-        # ==========================================
-        target_codes = valid_mf_stocks['ts_code'].tolist()
-        
-        df_daily_list = [pro.daily(trade_date=d) for d in dates_15]
-        df_daily_15d = pd.concat(df_daily_list)
-        # 仅保留有资金潜伏的股票，加快计算
-        df_daily_15d = df_daily_15d[df_daily_15d['ts_code'].isin(target_codes)]
-        
-        # 计算 15 天内的最高价、最低价
-        price_agg = df_daily_15d.groupby('ts_code').agg(
-            max_high=('high', 'max'),
-            min_low=('low', 'min')
-        ).reset_index()
-        
-        # 振幅 = (区间最高 - 区间最低) / 区间最低 * 100
-        price_agg['amplitude_15d'] = (price_agg['max_high'] - price_agg['min_low']) / price_agg['min_low'] * 100
-        
-        # 核心条件：15天内上下振幅 <= 25% (主力控盘压价)
-        cond_box = price_agg['amplitude_15d'] <= 25.0
-        valid_box_stocks = price_agg[cond_box]
-
-        # 增加防崩溃拦截：如果没票符合箱体要求，直接退出
-        if valid_box_stocks.empty:
-            logging.warning("资金潜伏标的中，未检测到符合【箱体压盘】特征的股票。")
-            return []
-
-        # ==========================================
-        # 模块三：【基础过滤与龙虎榜加分】
-        # ==========================================
-        # 获取最新一天的行情
-        df_today = pro.daily(trade_date=last_date)
-        # 获取基本面 (🚨 注意：这里已经去掉了 close，完美解决了 KeyError 问题)
-        df_basic = pro.daily_basic(trade_date=last_date, fields='ts_code,turnover_rate,total_mv')
+        # 3. 获取 T0 基本面与资金面
+        df_basic = pro.daily_basic(trade_date=T0, fields='ts_code,turnover_rate,total_mv')
         df_info = pro.stock_basic(exchange='', list_status='L', fields='ts_code,name,market')
         
-        # 多表合并
-        df = pd.merge(valid_mf_stocks, valid_box_stocks, on='ts_code')
-        df = pd.merge(df, df_today, on='ts_code')
-        df = pd.merge(df, df_basic, on='ts_code')
-        df = pd.merge(df, df_info, on='ts_code')
+        df_mf = pro.moneyflow(trade_date=T0)[['ts_code', 'net_mf_amount']]
 
-        # 龙虎榜机构数据探测 (近3日有无机构真金白银上榜)
-        inst_stocks = []
-        for d in dates_15[-3:]:
-            try:
-                top = pro.top_list(trade_date=d)
-                inst_stocks.extend(top[top['inst_buy'] > 0]['ts_code'].tolist())
-            except: 
-                pass
+        # 4. 数据全量合并 (使用 inner join 自动剔除停牌或新股)
+        df = df_t0.merge(df_t1, on='ts_code', how='inner') \
+                  .merge(df_t20, on='ts_code', how='inner') \
+                  .merge(df_t60, on='ts_code', how='inner') \
+                  .merge(df_basic, on='ts_code', how='inner') \
+                  .merge(df_info, on='ts_code', how='inner') \
+                  .merge(df_mf, on='ts_code', how='inner')
 
         # ==========================================
-        # 执行最终精准过滤
+        # 5. 执行科学量化筛选逻辑
         # ==========================================
-        # 1. 主板非 ST 且 价格 < 200
+        
+        # A. 基础过滤：主板 + 非ST + 股价<200
         cond_board = df['ts_code'].str.match(r'^(60|00)')
         cond_not_st = ~df['name'].str.contains('ST|退')
-        cond_price = df['close'] < 200
+        cond_price = df['close_T0'] < 200
         
-        # 2. 换手率 3% ~ 20% (建仓/初升健康换手)
-        cond_turnover = (df['turnover_rate'] >= 3.0) & (df['turnover_rate'] <= 20.0)
+        # B. 大势多头排列：今日收盘 > 20日 > 60日（确保不接飞刀，处于上升通道）
+        cond_trend = (df['close_T0'] > df['close_T20']) & (df['close_T20'] > df['close_T60'])
         
-        # 3. K线洗盘与点火突破 (-3% 到 9%)
-        cond_kline = (df['pct_chg'] >= -3.0) & (df['pct_chg'] <= 9.0)
+        # C. 近期蓄势区间：20日涨幅在 5% ~ 30% 之间（剔除长期死水和已经被爆炒到高位的妖股）
+        df['return_20d'] = (df['close_T0'] - df['close_T20']) / df['close_T20'] * 100
+        cond_momentum = (df['return_20d'] >= 5.0) & (df['return_20d'] <= 30.0)
+        
+        # D. 今日点火信号：
+        # 涨幅 2%~8%（温和突破，收阳线）且 成交量 > 昨日1.5倍（放量拉升，主力进场铁证）
+        cond_breakout = (df['pct_chg'] >= 2.0) & (df['pct_chg'] <= 8.0) & (df['close_T0'] > df['open'])
+        cond_volume = df['vol_T0'] > (df['vol_T1'] * 1.5)
+        
+        # E. 健康换手与主力资金护航：换手率 3~15%，且当日大单主力为净流入
+        cond_turnover = (df['turnover_rate'] >= 3.0) & (df['turnover_rate'] <= 15.0)
+        cond_money = df['net_mf_amount'] > 0
 
-        # 综合应用过滤条件
-        screened_df = df[cond_board & cond_not_st & cond_price & cond_turnover & cond_kline].copy()
+        # 应用所有条件
+        screened_df = df[
+            cond_board & cond_not_st & cond_price & 
+            cond_trend & cond_momentum & 
+            cond_breakout & cond_volume & 
+            cond_turnover & cond_money
+        ].copy()
 
         if screened_df.empty:
-            logging.warning("经过最终基本面与形态过滤，今日无符合条件的标的。")
+            logging.warning("今日市场环境较弱，未检测到符合【多头放量突破】的标的。")
             return []
 
-        # 计算打分排序：机构进场优先 > 5日潜伏资金总额
-        screened_df['is_inst'] = screened_df['ts_code'].apply(lambda x: 1 if x in inst_stocks else 0)
-        top_stocks = screened_df.sort_values(by=['is_inst', 'mf_5d_sum'], ascending=False).head(5)
+        # 6. 优中选优：按今日主力净流入资金量从大到小排序，只取前 5
+        top_stocks = screened_df.sort_values(by='net_mf_amount', ascending=False).head(5)
 
-        # 清洗代码格式 (例如把 000001.SZ 变成 000001 发给主程序)
+        # 提取股票代码并格式化
         stock_list = [code.split('.')[0] for code in top_stocks['ts_code'].tolist()]
         names = top_stocks['name'].tolist()
         
-        logging.info(f"🎯 主力吸筹模型扫描完毕！精选标的: {list(zip(stock_list, names))}")
+        logging.info(f"🎯 科学量化模型扫描完毕！擒获主升浪标的: {list(zip(stock_list, names))}")
         return stock_list
 
     except Exception as e:
@@ -148,5 +116,4 @@ if __name__ == "__main__":
     else:
         stocks = get_potential_stocks()
         if stocks:
-            # 这一行是给 GitHub Actions 捕获用的，绝对不要加多余的 print
             print(",".join(stocks))
