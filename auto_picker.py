@@ -13,97 +13,148 @@ pro = ts.pro_api(token)
 
 def get_potential_stocks():
     """
-    量化策略：【业内标准：多头趋势 + 放量突破 + 资金共振模型】
+    量化策略：【主升浪·量价突破与龙回头评分模型】
+    作者：基于顶尖游资与量化逻辑构建
     """
     try:
-        # 1. 获取最近 65 个交易日的日历，精准定位 T0, T-1, T-20, T-60
+        # ==========================================
+        # 0. 设定时间窗口
+        # ==========================================
+        # 取近 15 个交易日（确保能算准 5日线 并回溯涨停历史）
         cal = pro.trade_cal(exchange='', is_open='1', 
-                            start_date=(datetime.now() - timedelta(days=100)).strftime('%Y%m%d'), 
+                            start_date=(datetime.now() - timedelta(days=25)).strftime('%Y%m%d'), 
                             end_date=datetime.now().strftime('%Y%m%d'))
-        trade_dates = cal['cal_date'].tolist()
+        dates_15 = cal['cal_date'].tolist()[-15:]
+        dates_3 = dates_15[-3:]
         
-        T0 = trade_dates[-1]   # 今天(或最近一个交易日)
-        T1 = trade_dates[-2]   # 昨天
-        T20 = trade_dates[-21] # 20个交易日（约1个月前）
-        T60 = trade_dates[-61] # 60个交易日（约3个月前）
+        T0 = dates_15[-1] # 今日
+        T1 = dates_15[-2] # 昨日
         
-        logging.info(f"量化引擎启动，基准日: {T0}。比对周期: {T1}, {T20}, {T60}")
+        logging.info(f"🚀 趋势接力量化引擎启动，基准日: {T0}")
 
-        # 2. 提取不同时间节点的行情数据
-        # 获取 T0 (今日) 数据
-        df_t0 = pro.daily(trade_date=T0)[['ts_code', 'close', 'open', 'pct_chg', 'vol']]
-        df_t0.rename(columns={'close': 'close_T0', 'vol': 'vol_T0'}, inplace=True)
+        # ==========================================
+        # 1. 底层行情与 MA5 计算
+        # ==========================================
+        df_daily_15d = pro.daily(start_date=dates_15[0], end_date=T0)
+        df_daily_15d = df_daily_15d.sort_values(['ts_code', 'trade_date'])
         
-        # 获取 T1 (昨日) 数据，用于计算是否放量
-        df_t1 = pro.daily(trade_date=T1)[['ts_code', 'vol']]
-        df_t1.rename(columns={'vol': 'vol_T1'}, inplace=True)
+        # 计算 5 日均线
+        df_daily_15d['ma5'] = df_daily_15d.groupby('ts_code')['close'].transform(lambda x: x.rolling(5).mean())
         
-        # 获取 T20 和 T60 数据，用于判断长期趋势
-        df_t20 = pro.daily(trade_date=T20)[['ts_code', 'close']]
-        df_t20.rename(columns={'close': 'close_T20'}, inplace=True)
+        # 提取 T0 与 T1 行情
+        df_t0 = df_daily_15d[df_daily_15d['trade_date'] == T0].copy()
+        df_t1 = df_daily_15d[df_daily_15d['trade_date'] == T1][['ts_code', 'vol', 'ma5']]
+        df_t1.columns = ['ts_code', 'vol_t1', 'ma5_t1']
         
-        df_t60 = pro.daily(trade_date=T60)[['ts_code', 'close']]
-        df_t60.rename(columns={'close': 'close_T60'}, inplace=True)
+        df = pd.merge(df_t0, df_t1, on='ts_code', how='inner')
 
-        # 3. 获取 T0 基本面与资金面
+        # ==========================================
+        # 2. 挖掘“近期涨停”基因 (近10日内有过 >=9.5% 的涨幅)
+        # ==========================================
+        past_10_dates = dates_15[-11:-1] # T-10 到 T-1
+        df_past_10 = df_daily_15d[df_daily_15d['trade_date'].isin(past_10_dates)]
+        limit_up_codes = df_past_10[df_past_10['pct_chg'] >= 9.5]['ts_code'].unique().tolist()
+
+        # ==========================================
+        # 3. 主力资金与龙虎榜捕获 (近3日)
+        # ==========================================
+        # 资金建仓
+        df_mf_list = [pro.moneyflow(trade_date=d)[['ts_code', 'net_mf_amount']] for d in dates_3]
+        mf_agg = pd.concat(df_mf_list).groupby('ts_code')['net_mf_amount'].sum().reset_index()
+        mf_agg.rename(columns={'net_mf_amount': 'mf_3d_sum'}, inplace=True)
+        df = pd.merge(df, mf_agg, on='ts_code', how='inner')
+
+        # 龙虎榜
+        top_list_frames = []
+        for d in dates_3:
+            try:
+                top_df = pro.top_list(trade_date=d)
+                if not top_df.empty: top_list_frames.append(top_df)
+            except: pass
+            
+        top_codes, inst_buy_codes = [], []
+        if top_list_frames:
+            top_all = pd.concat(top_list_frames)
+            top_codes = top_all['ts_code'].unique().tolist()
+            # 机构真金白银净买入榜
+            inst_buy_codes = top_all[top_all['inst_buy'] > 0]['ts_code'].unique().tolist()
+
+        # ==========================================
+        # 4. 基础面融合
+        # ==========================================
         df_basic = pro.daily_basic(trade_date=T0, fields='ts_code,turnover_rate,total_mv')
         df_info = pro.stock_basic(exchange='', list_status='L', fields='ts_code,name,market')
         
-        df_mf = pro.moneyflow(trade_date=T0)[['ts_code', 'net_mf_amount']]
-
-        # 4. 数据全量合并 (使用 inner join 自动剔除停牌或新股)
-        df = df_t0.merge(df_t1, on='ts_code', how='inner') \
-                  .merge(df_t20, on='ts_code', how='inner') \
-                  .merge(df_t60, on='ts_code', how='inner') \
-                  .merge(df_basic, on='ts_code', how='inner') \
-                  .merge(df_info, on='ts_code', how='inner') \
-                  .merge(df_mf, on='ts_code', how='inner')
+        df = pd.merge(df, df_basic, on='ts_code', how='inner')
+        df = pd.merge(df, df_info, on='ts_code', how='inner')
 
         # ==========================================
-        # 5. 执行科学量化筛选逻辑
+        # 5. 【执行硬性过滤门槛】(你的 5 大法则)
         # ==========================================
-        
-        # A. 基础过滤：主板 + 非ST + 股价<200
+        # 法则 4：主板非ST，股价<200，换手率3%~35%
         cond_board = df['ts_code'].str.match(r'^(60|00)')
         cond_not_st = ~df['name'].str.contains('ST|退')
-        cond_price = df['close_T0'] < 200
+        cond_price = df['close'] < 200
+        cond_turnover = (df['turnover_rate'] >= 3.0) & (df['turnover_rate'] <= 35.0)
         
-        # B. 大势多头排列：今日收盘 > 20日 > 60日（确保不接飞刀，处于上升通道）
-        cond_trend = (df['close_T0'] > df['close_T20']) & (df['close_T20'] > df['close_T60'])
+        # 法则 3：量价点火铁证 (涨幅2%~11% + 成交量>昨1.5倍 + 成交额>5亿)
+        cond_ignition = (df['pct_chg'] >= 2.0) & (df['pct_chg'] <= 11.0)
+        cond_volume = df['vol'] > (df['vol_t1'] * 1.5)
+        cond_amt = df['amount'] >= 500000 # Tushare 单位千元，500,000=5亿
         
-        # C. 近期蓄势区间：20日涨幅在 5% ~ 30% 之间（剔除长期死水和已经被爆炒到高位的妖股）
-        df['return_20d'] = (df['close_T0'] - df['close_T20']) / df['close_T20'] * 100
-        cond_momentum = (df['return_20d'] >= 5.0) & (df['return_20d'] <= 30.0)
-        
-        # D. 今日点火信号：
-        # 涨幅 2%~8%（温和突破，收阳线）且 成交量 > 昨日1.5倍（放量拉升，主力进场铁证）
-        cond_breakout = (df['pct_chg'] >= 2.0) & (df['pct_chg'] <= 8.0) & (df['close_T0'] > df['open'])
-        cond_volume = df['vol_T0'] > (df['vol_T1'] * 1.5)
-        
-        # E. 健康换手与主力资金护航：换手率 3~15%，且当日大单主力为净流入
-        cond_turnover = (df['turnover_rate'] >= 3.0) & (df['turnover_rate'] <= 15.0)
-        cond_money = df['net_mf_amount'] > 0
+        # 法则 2：主力建仓 (近3日资金呈净流入状态)
+        cond_money = df['mf_3d_sum'] > 0
 
-        # 应用所有条件
+        # 法则 1：【趋势双轨承接算法】
+        # 轨道 A (踩5日线强承接): 5日线向上 + 盘中回踩极度逼近/击穿5日线(下探至1.02以内) + 收盘稳站5日线
+        cond_trend_A = (df['ma5'] > df['ma5_t1']) & (df['low'] <= df['ma5'] * 1.02) & (df['close'] > df['ma5'])
+        # 轨道 B (涨停洗盘后收复): 近期有过涨停 + 经历调整后今日强势站回5日线之上
+        cond_trend_B = df['ts_code'].isin(limit_up_codes) & (df['close'] > df['ma5'])
+        # 满足其一即可
+        cond_trend = cond_trend_A | cond_trend_B
+
+        # 组合所有过滤网
         screened_df = df[
-            cond_board & cond_not_st & cond_price & 
-            cond_trend & cond_momentum & 
-            cond_breakout & cond_volume & 
-            cond_turnover & cond_money
+            cond_board & cond_not_st & cond_price & cond_turnover & 
+            cond_ignition & cond_volume & cond_amt & 
+            cond_money & cond_trend
         ].copy()
 
         if screened_df.empty:
-            logging.warning("今日市场环境较弱，未检测到符合【多头放量突破】的标的。")
+            logging.warning("严苛模式下，今日未捕捉到符合【放量承接与涨停反包】的趋势股。")
             return []
 
-        # 6. 优中选优：按今日主力净流入资金量从大到小排序，只取前 5
-        top_stocks = screened_df.sort_values(by='net_mf_amount', ascending=False).head(5)
+        # ==========================================
+        # 6. 【多因子综合评分模型】(选出真正王者)
+        # ==========================================
+        screened_df['score'] = 0.0
 
-        # 提取股票代码并格式化
+        # 维度 1: 资金建仓力度 (3日主力净流入，每 1000 万得 1 分)
+        screened_df['score'] += (screened_df['mf_3d_sum'] / 1000)
+        
+        # 维度 2: 机构点火爆量 (放量倍数直接放大 15 倍，比如今天爆量 2 倍，得 30 分)
+        screened_df['score'] += (screened_df['vol'] / screened_df['vol_t1']) * 15
+        
+        # 维度 3: 市场绝对核心 (成交额每多 1 亿元得 2 分，大票流动性溢价)
+        screened_df['score'] += (screened_df['amount'] / 100000) * 2
+        
+        # 维度 4: 龙虎榜光环与涨停记忆 (情绪溢价)
+        screened_df.loc[screened_df['ts_code'].isin(top_codes), 'score'] += 20 # 上榜加20分
+        screened_df.loc[screened_df['ts_code'].isin(inst_buy_codes), 'score'] += 25 # 机构买入再加25分
+        screened_df.loc[screened_df['ts_code'].isin(limit_up_codes), 'score'] += 15 # 带有涨停基因加15分
+
+        # ==========================================
+        # 7. 终极决选与输出
+        # ==========================================
+        top_stocks = screened_df.sort_values(by='score', ascending=False).head(5)
+
         stock_list = [code.split('.')[0] for code in top_stocks['ts_code'].tolist()]
         names = top_stocks['name'].tolist()
+        scores = top_stocks['score'].round(1).tolist()
         
-        logging.info(f"🎯 科学量化模型扫描完毕！擒获主升浪标的: {list(zip(stock_list, names))}")
+        result_display = [f"{n}({c}) 综合分:{s}" for c, n, s in zip(stock_list, names, scores)]
+        logging.info(f"🏆 量化模型斩获龙头！今日前五大趋势标的: {result_display}")
+        
         return stock_list
 
     except Exception as e:
