@@ -4,7 +4,7 @@ import os
 import logging
 from datetime import datetime, timedelta
 
-# 配置日志输出格式
+# 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # 初始化 Tushare Pro
@@ -13,52 +13,49 @@ pro = ts.pro_api(token)
 
 def get_potential_stocks():
     """
-    量化策略：【极简·5日线稳健趋势与放量点火模型】
-    目标：获取 4 只完美踩稳5日线、量价齐升且主力建仓的纯正趋势股。
+    量化策略：【纯粹·5日线趋势与相对量能模型】
+    目标：获取 4 只精准回踩或收复 5 日线、主力流入、换手活跃的趋势标的。
     """
     try:
         # ==========================================
         # 0. 设定时间窗口与日历
         # ==========================================
         cal = pro.trade_cal(exchange='', is_open='1', 
-                            start_date=(datetime.now() - timedelta(days=30)).strftime('%Y%m%d'), 
+                            start_date=(datetime.now() - timedelta(days=25)).strftime('%Y%m%d'), 
                             end_date=datetime.now().strftime('%Y%m%d'))
         trade_dates = cal['cal_date'].tolist()
         
+        if len(trade_dates) < 5:
+            logging.warning("交易日历获取不足，请检查 Tushare 接口。")
+            return []
+
         T0 = trade_dates[-1]  # 今日
-        T1 = trade_dates[-2]  # 昨日
-        T2 = trade_dates[-3]  # 前日
-        T3 = trade_dates[-4]  # 大前天
+        dates_15 = trade_dates[-15:] # 近15日用于算均线
+        dates_3 = trade_dates[-3:]   # 近3日用于算资金
         
-        dates_15 = trade_dates[-15:] # 取近15日计算MA5
-        dates_3 = trade_dates[-3:]   # 近3日看主力资金
-        
-        logging.info(f"🚀 极简趋势雷达启动，基准日: {T0}")
+        logging.info(f"🚀 趋势极简雷达启动，基准日: {T0}")
 
         # ==========================================
-        # 1. 底层行情、MA5 计算与时间平移
+        # 1. 行情与 MA5 相对位置计算
         # ==========================================
         df_daily = pro.daily(start_date=dates_15[0], end_date=T0)
+        # 必须按时间升序排，保证 shift 平移正确
         df_daily = df_daily.sort_values(['ts_code', 'trade_date'])
         
         # 计算 5 日均线
         df_daily['ma5'] = df_daily.groupby('ts_code')['close'].transform(lambda x: x.rolling(5).mean())
         
-        # 将 T1, T2, T3 的关键数据平移到 T0 行，方便直接做对比
+        # 使用 shift 获取历史数据到同一行，避免复杂的 merge
         df_daily['close_t1'] = df_daily.groupby('ts_code')['close'].shift(1)
-        df_daily['ma5_t1'] = df_daily.groupby('ts_code')['ma5'].shift(1)
         df_daily['vol_t1'] = df_daily.groupby('ts_code')['vol'].shift(1)
-        
-        df_daily['close_t2'] = df_daily.groupby('ts_code')['close'].shift(2)
-        df_daily['ma5_t2'] = df_daily.groupby('ts_code')['ma5'].shift(2)
-        
+        df_daily['ma5_t1'] = df_daily.groupby('ts_code')['ma5'].shift(1)
         df_daily['ma5_t3'] = df_daily.groupby('ts_code')['ma5'].shift(3)
         
-        # 只保留 T0 (今日) 的切片数据
+        # 截取今日(T0)数据进行判定
         df_t0 = df_daily[df_daily['trade_date'] == T0].copy()
 
         # ==========================================
-        # 2. 主力资金持续流入建仓 (近3日)
+        # 2. 主力资金流入 (近3日)
         # ==========================================
         df_mf_list = []
         for d in dates_3:
@@ -77,7 +74,7 @@ def get_potential_stocks():
             df_t0['mf_3d_sum'] = 0.0
 
         # ==========================================
-        # 3. 基础面融合
+        # 3. 基础面融合 (引入换手率)
         # ==========================================
         df_basic = pro.daily_basic(trade_date=T0, fields='ts_code,turnover_rate,total_mv')
         df_info = pro.stock_basic(exchange='', list_status='L', fields='ts_code,name,market')
@@ -89,55 +86,58 @@ def get_potential_stocks():
         # 4. 执行严谨的量化过滤逻辑
         # ==========================================
         
-        # A. 基础要求：主板非ST，股价<200，换手活跃
+        # A. 基础：主板非ST，股价<200
         cond_board = df['ts_code'].str.match(r'^(60|00)')
         cond_not_st = ~df['name'].str.contains('ST|退')
         cond_price = df['close'] < 200
-        cond_turnover = df['turnover_rate'] >= 3.0
         
-        # B. 量价齐升与流动性：
-        # 今日涨幅 1% ~ 11%
-        # 成交量 > 昨 1.2倍
-        # 成交额 > 5亿 (Tushare单位千元，500,000=5亿)
+        # B. 相对流动性 (你提议的换手率逻辑)：
+        # 换手率 >= 3.0% (代表个股自身的活跃度达标)
+        # 保底成交额 >= 1亿 (100,000千元，剔除极其迷你、容易被几百万操纵的僵尸股)
+        cond_liquidity = (df['turnover_rate'] >= 3.0) & (df['amount'] >= 100000)
+        
+        # C. 量价齐升与点火：涨幅 1% ~ 11%，量 > 昨 1.2倍
         cond_ignition = (df['pct_chg'] >= 1.0) & (df['pct_chg'] <= 11.0)
         cond_volume = df['vol'] > (df['vol_t1'] * 1.2)
-        cond_amt = df['amount'] >= 500000 
         
-        # C. 资金建仓：
-        # 如果获取到了资金数据，要求近3天主力累计净流入 > 0
+        # D. 资金建仓：若有资金数据，近3日必须为净流入
         cond_money = (df['mf_3d_sum'] > 0) if has_mf else True
         
-        # D. 核心趋势：神仙 5 日线算法
-        # 1. 稳步上涨: 今天的5日线必须高于大前天的5日线 (ma5 > ma5_t3)
-        # 2. 今日站稳: 今天的收盘价必须 > 今天的5日线
-        # 3. 隔日收复(拒绝连续破位): 昨天或前天，必须有至少一天是站稳在当时5日线之上的
-        cond_trend = (
-            (df['ma5'] > df['ma5_t3']) & 
-            (df['close'] > df['ma5']) & 
-            ((df['close_t1'] > df['ma5_t1']) | (df['close_t2'] > df['ma5_t2']))
-        )
+        # E. 神仙 5 日线算法 (回调/收复二选一)
+        # 1. 均线大方向必须向上
+        cond_ma5_up = df['ma5'] > df['ma5_t3']
+        # 2. 今天必须收在 5 日线上
+        cond_stand_on_ma5 = df['close'] > df['ma5']
+        
+        # 3. 灵活判定买点：
+        # 情形 1 [精准回踩]: 今天盘中最低价下探，距离 5日线不到 3%，说明踩到了强支撑
+        cond_pullback = df['low'] <= (df['ma5'] * 1.03)
+        # 情形 2 [强势收复]: 昨天收盘还在 5日线下方(洗盘)，今天放量站回来了
+        cond_recover = df['close_t1'] < df['ma5_t1']
+        
+        cond_trend = cond_ma5_up & cond_stand_on_ma5 & (cond_pullback | cond_recover)
 
-        # 汇总所有条件
+        # 汇总
         screened_df = df[
-            cond_board & cond_not_st & cond_price & cond_turnover & 
-            cond_ignition & cond_volume & cond_amt & 
+            cond_board & cond_not_st & cond_price & 
+            cond_liquidity & cond_ignition & cond_volume & 
             cond_money & cond_trend
         ].copy()
 
         if screened_df.empty:
-            logging.warning("今日市场环境较弱，未捕捉到完美贴合【5日线强承接+爆量】的标的。")
+            logging.warning("当前市场未出现完美契合【5日线回踩/收复 + 放量1.2倍】的标的。")
             return []
 
         # ==========================================
         # 5. 排序与精选 (取前 4 只)
         # ==========================================
-        # 按【今日成交额】(代表市场绝对聚焦人气) 和 【主力流入量】 降序排列
-        top_stocks = screened_df.sort_values(by=['amount', 'mf_3d_sum'], ascending=[False, False]).head(4)
+        # 按【换手率】(个股相对热度) 和 【主力流入量】 降序排列
+        top_stocks = screened_df.sort_values(by=['turnover_rate', 'mf_3d_sum'], ascending=[False, False]).head(4)
 
         stock_list = [code.split('.')[0] for code in top_stocks['ts_code'].tolist()]
         names = top_stocks['name'].tolist()
         
-        logging.info(f"🎯 趋势量化模型斩获龙头！精选 4 只标的: {list(zip(stock_list, names))}")
+        logging.info(f"🎯 趋势量化雷达锁定！精选 4 只趋势标的: {list(zip(stock_list, names))}")
         
         return stock_list
 
